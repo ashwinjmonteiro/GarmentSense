@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -464,25 +464,13 @@ def extract_top_landmarks(clothing_mask):
     }
 
 
-def extract_top_landmarks_with_orientation(processor, state, pil_image, top_mask):
-    """Try sideways orientations for ambiguous top masks, then map landmarks back."""
-    ys, xs = np.where(top_mask)
-    if len(xs) == 0:
-        return None
-    box_w = int(xs.max() - xs.min() + 1)
-    box_h = int(ys.max() - ys.min() + 1)
-    aspect = max(box_w, box_h) / max(1, min(box_w, box_h))
-
-    # Rotation checks are useful when sleeves make a sideways top's bounding
-    # box nearly square; skip clearly upright or wide silhouettes.
-    if aspect > 1.25:
-        return extract_top_landmarks(top_mask)
-
-    def best_top_candidate(candidate_state, candidate_shape):
+def rotate_misoriented_top_image(processor, state, pil_image):
+    """Rotate the full image only if SAM is clearly more confident in another orientation."""
+    def best_top_score(candidate_state, shape):
         best_mask, best_score = None, -1.0
         for prompt in ("shirt", "t-shirt"):
             candidate_mask, _, score = get_mask_and_box(
-                processor, candidate_state, prompt, candidate_shape
+                processor, candidate_state, prompt, shape
             )
             if candidate_mask is not None and score > best_score:
                 best_mask, best_score = candidate_mask, score
@@ -490,52 +478,31 @@ def extract_top_landmarks_with_orientation(processor, state, pil_image, top_mask
 
     with torch.inference_mode():
         if device == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                best_mask, best_score = best_top_candidate(
-                    state, (pil_image.height, pil_image.width)
-                )
-                best_angle = 0
-                for angle in (90, 270):
-                    rotated_image = pil_image.rotate(angle, expand=True)
-                    rotated_state = processor.set_image(rotated_image)
-                    rotated_mask, rotated_score = best_top_candidate(
-                        rotated_state, (rotated_image.height, rotated_image.width)
-                    )
-                    if rotated_mask is not None and rotated_score > best_score + 0.04:
-                        best_mask, best_score, best_angle = (
-                            rotated_mask, rotated_score, angle
-                        )
+            context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         else:
-            best_mask, best_score = best_top_candidate(
+            context = torch.no_grad()
+        with context:
+            _, current_score = best_top_score(
                 state, (pil_image.height, pil_image.width)
             )
             best_angle = 0
-            for angle in (90, 270):
-                rotated_image = pil_image.rotate(angle, expand=True)
-                rotated_state = processor.set_image(rotated_image)
-                rotated_mask, rotated_score = best_top_candidate(
-                    rotated_state, (rotated_image.height, rotated_image.width)
+            best_score = current_score
+            for angle in (90, 180, 270):
+                candidate_image = pil_image.rotate(angle, expand=True)
+                candidate_state = processor.set_image(candidate_image)
+                _, candidate_score = best_top_score(
+                    candidate_state,
+                    (candidate_image.height, candidate_image.width),
                 )
-                if rotated_mask is not None and rotated_score > best_score + 0.04:
-                    best_mask, best_score, best_angle = (
-                        rotated_mask, rotated_score, angle
-                    )
+                if candidate_score > best_score:
+                    best_angle = angle
+                    best_score = candidate_score
 
-    if best_mask is None:
-        return extract_top_landmarks(top_mask)
-    landmarks = extract_top_landmarks(best_mask)
-    if landmarks is None or best_angle == 0:
-        return landmarks
-
-    original_width, original_height = pil_image.size
-
-    def map_point(point):
-        x, y = map(int, point)
-        if best_angle == 90:  # PIL rotates counterclockwise.
-            return original_width - 1 - y, x
-        return y, original_height - 1 - x  # PIL 270 degrees is clockwise.
-
-    return {name: map_point(point) for name, point in landmarks.items()}
+    # Require a meaningful confidence gain so upright images with sleeves,
+    # hangers, or broad silhouettes are left in their original orientation.
+    if best_angle == 0 or best_score < current_score + 0.012:
+        return None
+    return pil_image.rotate(best_angle, expand=True)
 
 
 def extract_pants_landmarks(pants_mask):
@@ -793,7 +760,7 @@ def measure_garment_auto(
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    pil_image = Image.open(image_path).convert("RGB")
+    pil_image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
     cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     h, w, _ = cv_image.shape
 
@@ -823,6 +790,42 @@ def measure_garment_auto(
             garment_type, cloth_mask, detected_label = classify_garment_with_variants(
                 processor, state, (h, w)
             )
+
+    # If a top is laid sideways, rotate the complete source image and run SAM
+    # again so the card, garment mask, landmarks, and overlay share one coordinate
+    # system. This avoids mapping rotated landmarks back onto the sideways frame.
+    if garment_type == "top" and cloth_mask is not None:
+        rotated_image = rotate_misoriented_top_image(processor, state, pil_image)
+        if rotated_image is not None:
+            pil_image = rotated_image
+            cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+            h, w, _ = cv_image.shape
+            with torch.inference_mode():
+                if device == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        state = processor.set_image(pil_image)
+                        card_mask, card_rect, _ = get_mask_and_box(
+                            processor, state, card_prompt, (h, w)
+                        )
+                        if card_mask is None and card_prompt != "card":
+                            card_mask, card_rect, _ = get_mask_and_box(
+                                processor, state, "card", (h, w)
+                            )
+                        garment_type, cloth_mask, detected_label = classify_garment_with_variants(
+                            processor, state, (h, w)
+                        )
+                else:
+                    state = processor.set_image(pil_image)
+                    card_mask, card_rect, _ = get_mask_and_box(
+                        processor, state, card_prompt, (h, w)
+                    )
+                    if card_mask is None and card_prompt != "card":
+                        card_mask, card_rect, _ = get_mask_and_box(
+                            processor, state, "card", (h, w)
+                        )
+                    garment_type, cloth_mask, detected_label = classify_garment_with_variants(
+                        processor, state, (h, w)
+                    )
 
     if cloth_mask is None:
         print("Error: Could not segment clothing item.")
@@ -931,9 +934,7 @@ def measure_garment_auto(
         ]
 
     else:
-        lm = extract_top_landmarks_with_orientation(
-            processor, state, pil_image, cloth_mask
-        )
+        lm = extract_top_landmarks(cloth_mask)
         if lm is None:
             return
 
