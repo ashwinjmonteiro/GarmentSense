@@ -1,0 +1,41 @@
+# Python environments
+.venv/
+.venv_*/
+venv/
+env/
+ENV/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.huggingface/
+
+# Downloaded model weights and checkpoints (GitHub has a 100 MB per-file limit)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Local editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
