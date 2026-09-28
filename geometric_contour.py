@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -209,7 +209,12 @@ def extract_top_landmarks(clothing_mask):
     left_armpits, right_armpits = [], []
     if defects is not None:
         for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
+            defect = np.asarray(defects[i]).reshape(-1)
+
+            if defect.size != 4:
+                continue
+
+            s, e, f, d = defect
             depth = d / 256.0
             pt = tuple(contour[f][0])
             if depth > 18.0 and collar_pt[1] + 25 < pt[1] < hem_pt[1] - 30:
@@ -438,7 +443,12 @@ def extract_pants_landmarks(pants_mask):
     if defects is not None:
         crotch_cands = []
         for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
+            defect = np.asarray(defects[i]).reshape(-1)
+
+            if defect.size != 4:
+                continue
+
+            s, e, f, d = defect
             depth = d / 256.0
             pt = tuple(contour[f][0])
             if depth > 20.0 and abs(pt[0] - cx) < pants_mask.shape[1] * 0.18 and pt[1] > y_min + 50:
@@ -536,7 +546,7 @@ def measure_garment_auto(
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    pil_image = Image.open(image_path).convert("RGB")
+    pil_image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
     cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     h, w, _ = cv_image.shape
 
@@ -627,4 +637,4 @@ def measure_garment_auto(
 
 
 if __name__ == "__main__":
-    measure_garment_auto("test_clothes/long_pants.jpg")
+    measure_garment_auto("../images/t-shirt/t1.png")
