@@ -1,4 +1,5 @@
 # Python environments
+.venv_sam3/
 .venv/
 .venv_*/
 venv/
@@ -39,3 +40,7 @@ Desktop.ini
 # Logs and temporary files
 *.log
 *.tmp
+
+# Generated exploratory test output
+main_full_test_results/
+test_measurement_results/

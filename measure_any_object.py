@@ -136,7 +136,7 @@ def measure_objects_with_card(
     image_path: str,
     target_prompt: str,
     card_prompt: str = "credit card",
-    output_dir: str = "./measurement_results"
+    output_dir: str = "./measure_any_object_results"
 ):
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Target image not found: {image_path}")
