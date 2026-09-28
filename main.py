@@ -14,10 +14,10 @@ CM_PER_INCH = 2.54
 TOP_SIZE_REFERENCE = [
     # Common Indian shirt garment measurements in inches:
     # label, chest circumference, shoulder width, body length, long sleeve.
-    ("S", 38.3, 16.0, 28.3, 24.0),
-    ("M", 40.5, 17.0, 29.0, 25.0),
-    ("L", 43.8, 18.0, 29.8, 26.0),
-    ("XL", 46.0, 19.0, 30.5, 27.0),
+    ("S", 38.3, 16.0, 28.3, 22.0),
+    ("M", 40.5, 17.0, 29.0, 23.0),
+    ("L", 43.8, 18.0, 29.8, 24.0),
+    ("XL", 46.0, 19.0, 30.5, 26.0),
     ("XXL", 49.3, 20.0, 31.3, 28.0),
 ]
 
@@ -203,20 +203,24 @@ def classify_garment(processor, state, image_shape):
         active_mask = best_top_mask if best_top_mask is not None else best_bot_mask
         label = best_top_name
 
-    if active_mask is not None:
+    # Do not let a single horizontal slice reclassify a horizontally rotated
+    # shirt as pants. Require both a pants-prompt mask and an upright silhouette
+    # before using the leg-transition fallback.
+    if active_mask is not None and best_bot_mask is not None:
         mask_u8 = (active_mask * 255).astype(np.uint8)
         contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             cnt = max(contours, key=cv2.contourArea)
-            y, h = cv2.boundingRect(cnt)[1], cv2.boundingRect(cnt)[3]
-            slice_y = int(y + h * 0.85)
-            if slice_y < mask_u8.shape[0]:
-                row = mask_u8[slice_y, :]
-                diff = np.diff(row.astype(int))
-                transitions = np.count_nonzero(diff != 0)
-                if transitions >= 4:
-                    garment_type = "pants"
-                    label = "pants"
+            x, y, w, h = cv2.boundingRect(cnt)
+            if h > w * 1.05:
+                slice_y = int(y + h * 0.85)
+                if slice_y < mask_u8.shape[0]:
+                    row = mask_u8[slice_y, :]
+                    diff = np.diff(row.astype(int))
+                    transitions = np.count_nonzero(diff != 0)
+                    if transitions >= 4:
+                        garment_type = "pants"
+                        label = "pants"
 
     return garment_type, active_mask, label
 
@@ -283,7 +287,10 @@ def extract_top_landmarks(clothing_mask):
     left_armpits, right_armpits = [], []
     if defects is not None:
         for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
+            defect = np.asarray(defects[i]).reshape(-1)
+            if defect.size != 4:
+                continue
+            s, e, f, d = defect
             depth = d / 256.0
             pt = tuple(contour[f][0])
             if depth > 18.0 and collar_pt[1] + 25 < pt[1] < hem_pt[1] - 30:
@@ -359,41 +366,11 @@ def extract_top_landmarks(clothing_mask):
                 if len(smooth_edge) < 5:
                     return tuple(top_edge[len(top_edge) // 2])
 
-                angles = []
-
-                for i in range(2, len(smooth_edge) - 2):
-                    v1 = smooth_edge[i] - smooth_edge[i - 2]
-                    v2 = smooth_edge[i + 2] - smooth_edge[i]
-
-                    n1 = np.linalg.norm(v1)
-                    n2 = np.linalg.norm(v2)
-
-                    if n1 == 0 or n2 == 0:
-                        angles.append(0.0)
-                        continue
-
-                    cosine = np.dot(v1, v2) / (n1 * n2)
-                    cosine = np.clip(cosine, -1.0, 1.0)
-
-                    angle = np.arccos(cosine)
-                    angles.append(angle)
-
-                if not angles:
-                    return tuple(top_edge[len(top_edge) // 2])
-
-                margin = max(2, int(len(angles) * 0.08))
-
-                search_start = margin
-                search_end = len(angles) - margin
-
-                if search_end <= search_start:
-                    return tuple(top_edge[len(top_edge) // 2])
-
-                local_angles = np.array(angles[search_start:search_end])
-
-                best_local_idx = int(np.argmax(local_angles))
-                best_idx = best_local_idx + search_start + 2
-
+                # Use a stable point along the shoulder slope rather than the
+                # largest local contour angle, which often locks onto the neck
+                # seam or a wrinkle on wide/uneven flat-lay shirts.
+                target_x = neck_pt[0] + (pit_pt[0] - neck_pt[0]) * 0.80
+                best_idx = int(np.argmin(np.abs(smooth_edge[:, 0] - target_x)))
                 shoulder_pt = smooth_edge[best_idx]
 
                 return (
@@ -487,6 +464,80 @@ def extract_top_landmarks(clothing_mask):
     }
 
 
+def extract_top_landmarks_with_orientation(processor, state, pil_image, top_mask):
+    """Try sideways orientations for ambiguous top masks, then map landmarks back."""
+    ys, xs = np.where(top_mask)
+    if len(xs) == 0:
+        return None
+    box_w = int(xs.max() - xs.min() + 1)
+    box_h = int(ys.max() - ys.min() + 1)
+    aspect = max(box_w, box_h) / max(1, min(box_w, box_h))
+
+    # Rotation checks are useful when sleeves make a sideways top's bounding
+    # box nearly square; skip clearly upright or wide silhouettes.
+    if aspect > 1.25:
+        return extract_top_landmarks(top_mask)
+
+    def best_top_candidate(candidate_state, candidate_shape):
+        best_mask, best_score = None, -1.0
+        for prompt in ("shirt", "t-shirt"):
+            candidate_mask, _, score = get_mask_and_box(
+                processor, candidate_state, prompt, candidate_shape
+            )
+            if candidate_mask is not None and score > best_score:
+                best_mask, best_score = candidate_mask, score
+        return best_mask, best_score
+
+    with torch.inference_mode():
+        if device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                best_mask, best_score = best_top_candidate(
+                    state, (pil_image.height, pil_image.width)
+                )
+                best_angle = 0
+                for angle in (90, 270):
+                    rotated_image = pil_image.rotate(angle, expand=True)
+                    rotated_state = processor.set_image(rotated_image)
+                    rotated_mask, rotated_score = best_top_candidate(
+                        rotated_state, (rotated_image.height, rotated_image.width)
+                    )
+                    if rotated_mask is not None and rotated_score > best_score + 0.04:
+                        best_mask, best_score, best_angle = (
+                            rotated_mask, rotated_score, angle
+                        )
+        else:
+            best_mask, best_score = best_top_candidate(
+                state, (pil_image.height, pil_image.width)
+            )
+            best_angle = 0
+            for angle in (90, 270):
+                rotated_image = pil_image.rotate(angle, expand=True)
+                rotated_state = processor.set_image(rotated_image)
+                rotated_mask, rotated_score = best_top_candidate(
+                    rotated_state, (rotated_image.height, rotated_image.width)
+                )
+                if rotated_mask is not None and rotated_score > best_score + 0.04:
+                    best_mask, best_score, best_angle = (
+                        rotated_mask, rotated_score, angle
+                    )
+
+    if best_mask is None:
+        return extract_top_landmarks(top_mask)
+    landmarks = extract_top_landmarks(best_mask)
+    if landmarks is None or best_angle == 0:
+        return landmarks
+
+    original_width, original_height = pil_image.size
+
+    def map_point(point):
+        x, y = map(int, point)
+        if best_angle == 90:  # PIL rotates counterclockwise.
+            return original_width - 1 - y, x
+        return y, original_height - 1 - x  # PIL 270 degrees is clockwise.
+
+    return {name: map_point(point) for name, point in landmarks.items()}
+
+
 def extract_pants_landmarks(pants_mask):
     mask_u8 = (pants_mask * 255).astype(np.uint8)
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -512,7 +563,10 @@ def extract_pants_landmarks(pants_mask):
     if defects is not None:
         crotch_cands = []
         for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
+            defect = np.asarray(defects[i]).reshape(-1)
+            if defect.size != 4:
+                continue
+            s, e, f, d = defect
             depth = d / 256.0
             pt = tuple(contour[f][0])
             if depth > 20.0 and abs(pt[0] - cx) < pants_mask.shape[1] * 0.18 and pt[1] > y_min + 50:
@@ -877,7 +931,9 @@ def measure_garment_auto(
         ]
 
     else:
-        lm = extract_top_landmarks(cloth_mask)
+        lm = extract_top_landmarks_with_orientation(
+            processor, state, pil_image, cloth_mask
+        )
         if lm is None:
             return
 
@@ -939,4 +995,4 @@ def measure_garment_auto(
 
 
 if __name__ == "__main__":
-    measure_garment_auto("test_clothes/long_sleeve.jpg")
+    measure_garment_auto("test_clothes/cloth11.jpeg")
